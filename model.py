@@ -93,7 +93,7 @@ class Model(nn.Module):
         logits = self.logits(x)
         policy = F.log_softmax(logits).squeeze(0)  # shape: (ac_space)
 
-        vf = torch.squeeze(self.vf(x))  # shape: (1)
+        vf = self.vf(x).squeeze()  # shape: (1)
         return policy, vf, state_out
 
     def get_initial_state(self) -> 'ModelState':

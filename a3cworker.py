@@ -13,8 +13,21 @@ import torch.optim as optim
 from torch import autograd
 from torch import multiprocessing
 
+def run_env(conn, env):
+    obsTensor = torch.FloatTensor(env._reset())
+    obsTensor.share_memory_()
+    conn.send((obsTensor, None, False, {}))
+    while True:
+        action = conn.recv()
+        obs, reward_val, done, info = env.step(action)
+        if done:
+            obs = env._reset()
+        obs = torch.FloatTensor(obs)
+        obsTensor.copy_(obs)
+        conn.send((obsTensor, reward_val, done, info))
 
-class A3C:
+
+class A3CWorker:
     r"""Implementation of the A3C reinforcement learning algorithm for use with the OpenAI Gym/Universe.
 
     The algorithm is from the following paper:
@@ -33,8 +46,9 @@ class A3C:
 
     """
     def __init__(self,
-                 environments: Iterable[gym.Env],
+                 environment: gym.Env,
                  model: nn.Module,
+                 worker_id: int = 0,
                  optimizer: optim.Optimizer=None,
                  min_update_period: int=15,
                  max_update_period: int=30,
@@ -43,34 +57,38 @@ class A3C:
                  checkpoint_dir: str=None,
                  terminate: multiprocessing.Value=None,
                  global_steps: multiprocessing.Value=None):
-        self.environments = list(environments)
-        self.environment_id = 0
-        self.states = [None] * len(self.environments)
-        self.observations = [None] * len(self.environments)
+        self.environment = environment
+        self.model_state = None
         self.min_update_period = min_update_period
         self.max_update_period = max_update_period
         self.gamma = gamma
-        self.is_cuda = model.is_cuda
         self.log_dir = log_dir
         if checkpoint_dir is None:
             self.checkpoint_dir = os.path.join(log_dir, 'checkpoints')
         else:
             self.checkpoint_dir = checkpoint_dir
-        self.render = False
         self.global_model = model
-        self.value_estimates = []
+        self.model = model.clone()
+        self.observation = None
+        self.value_estimates_list = []
+        self.value_estimates_var = None
         self.actions = []
-        self.rewards = []
+        self.rewards_list = []
+        self.log_likelihood_list = []
+        self.entropy = 0
         self.local_steps = 0
         self.episode = 0
         self.global_steps = global_steps
         self.terminate = terminate
-        self.worker_id = None
+        self.worker_id = worker_id
         self.info = None
         self.episode_done = False
         self.optimizer = optimizer
-        self.log_likelihood = []
-        self.entropy = 0
+        self.worker_id = worker_id
+        self.summary_writer = tf.summary.FileWriter(os.path.join(self.log_dir, 'train_{}'.format(worker_id)))
+        self.conn, runner_conn = multiprocessing.Pipe()
+        self.env_runner = multiprocessing.Process(target=run_env, args=(runner_conn, self.environment))
+        self.env_runner.start()
 
     def weights_path(self):
         r"""Path to file where model weights are saved/loaded
@@ -134,76 +152,52 @@ class A3C:
         self.load_state_dict(state_dict)
         return True
 
-    def run(self, worker_id: int = 0, render: bool =None, optimizer=None):
-        r""" Entry point for worker.
-
-        Args:
-            worker_id: a unique identifier for this worker. Should be in `range(num_workers)`
-            render: overrides the render field for this worker.
-
-        """
-        if callable(self.optimizer):
-            self.optimizer = self.optimizer()
-        self.worker_id = worker_id
-        if render is not None:
-            self.render = render
-        if optimizer is not None:
-            self.optimizer = optimizer
-        if self.optimizer is None:
-            self.optimizer = optim.RMSprop(self.global_model.parameters(), lr=1e-3)
-
-        self.model = self.global_model.clone()
-        self.summary_writer = tf.summary.FileWriter(os.path.join(self.log_dir, 'train_{}'.format(worker_id)))
-
-        while not self.terminate.value:
-            self._step()
-
-    def _step(self):
-        r"""Runs the simulation long enough to update the model weights once"""
-        self.log_likelihood = []
+    def _reset(self):
+        self.log_likelihood_list = []
         self.entropy = 0
-        self.rewards = []
-        self.value_estimates = []
+        self.rewards_list = []
+        self.value_estimates_list = []
         self.model.load_parameters(self.global_model)
-        update_period = np.random.randint(self.min_update_period, self.max_update_period)
-        for _ in range(update_period):
-            if self.render:
-                self._environment().render()
-            self._act()
-            if self.episode_done:
-                break
-        self._backward_step()
-        self._update_weights()
-        self._output_summary()
-        self.global_steps.value += len(self.log_likelihood)
-        self.local_steps += 1
-        if self.episode_done:
-            self.episode += 1
-            self._set_state(None)
+        self.update_period = np.random.randint(self.min_update_period, self.max_update_period)
+        if self.model_state is None:
+            self.model_state = self.model.get_initial_state()
         else:
-            self._state().detach_()
-        self._next_environment()
+            self.model_state.detach_()
+
+    def step(self):
+        r"""Advance the simulation by one action. Update the weights if necessary"""
+        if self.model_state is None:
+            self._reset()
+        obs, reward_val, self.episode_done, self.info = self.conn.recv()
+        self.observation = autograd.Variable(obs.cuda())
+        if reward_val is not None:
+            self.rewards_list.append(reward_val)
+
+        if self.update_period <= 0 or self.episode_done:
+            self._backward_step()
+            self._update_weights()
+            self._output_summary()
+            self.global_steps.value += len(self.log_likelihood_list)
+            if self.episode_done:
+                self.model_state = None
+                self.episode += 1
+            self._reset()
+
+        self._act()
+        self.local_steps += 1
+        self.update_period -= 1
 
     def _act(self):
         r"""Sample from the current policy and perform an action"""
-        log_prob, value, state = self.model(self._observation(), self._state())
-        self._set_state(state)
+        log_prob, value, self.model_state = self.model(self.observation, self.model_state)
         prob = torch.exp(log_prob)
         self.entropy -= (prob * log_prob).sum()
 
         action = prob.data.multinomial(1).cpu().numpy()[0]
-        observation, reward_val, done, info = self._environment().step(action)
-        self._set_observation(observation)
+        self.conn.send(action)
 
-        self.rewards.append(reward_val)
-        self.value_estimates.append(value)
-        self.log_likelihood.append(log_prob[action])
-
-        if done:
-            self._set_observation(None)
-
-        self.episode_done = done
-        self.info = info or {}
+        self.value_estimates_list.append(value)
+        self.log_likelihood_list.append(log_prob[action])
 
     def _backward_step(self):
         r"""Backpropogate the loss from the current batch, computing the gradients"""
@@ -212,7 +206,7 @@ class A3C:
         loss.backward()
         utils.clip_grad_norm(self.model.parameters(), 40)
 
-    def _loss(self):
+    def _loss(self) -> autograd.Variable:
         r"""Compute the loss function for the current batch"""
 
         self._get_final_value()
@@ -220,39 +214,39 @@ class A3C:
         value_loss = self._get_value_loss()
         loss = policy_loss + 0.5 * value_loss - 0.01 * self.entropy
 
-        batch_size = len(self.log_likelihood)
+        batch_size = len(self.log_likelihood_list)
         if self._should_compute_summary():
             self.info["model/policy_loss"] = policy_loss.data.cpu().numpy()[0] / batch_size
             self.info["model/value_loss"] = value_loss.data.cpu().numpy()[0] / batch_size
 
         return loss
 
-    def _get_value_loss(self):
+    def _get_value_loss(self) -> autograd.Variable:
         r"""Computes the loss function for the value estimates"""
-        discounted_rewards = self._discount(self.rewards.data.cpu().numpy())
-        return 0.5 * ((self.value_estimates - discounted_rewards) ** 2).sum()
+        discounted_rewards = self._discount(self.rewards_var.data.cpu().numpy())
+        return 0.5 * ((self.value_estimates_var - discounted_rewards) ** 2).sum()
 
-    def _get_policy_loss(self):
+    def _get_policy_loss(self) -> autograd.Variable:
         r"""Computes the loss function for the policy"""
-        advantage_delta = self.rewards[:-1] - self.value_estimates[:-1] + self.gamma * self.value_estimates[1:]
+        advantage_delta = self.rewards_var[:-1] - self.value_estimates_var[:-1] + self.gamma * self.value_estimates_var[1:]
         advantage = self._discount(advantage_delta.data.cpu().numpy())
-        return -torch.sum(self.log_likelihood * advantage)
+        return -torch.sum(self.log_likelihood_var * advantage)
 
     def _get_final_value(self):
         r"""Computes the estimated value of the observation in the batch"""
         if self.episode_done:
             final_value = self._float_var([0.0])
         else:
-            _, final_value, _ = self.model(self._observation(), self._state())
-        self.value_estimates.append(final_value)
-        self.rewards.append(final_value.data[0])
+            _, final_value, _ = self.model(self.observation, self.model_state)
+        self.value_estimates_list.append(final_value)
+        self.rewards_list.append(final_value.data[0])
 
-        def cat_vars(vars):
-            return torch.cat([v.unsqueeze(0) for v in vars])
+        def cat_vars(vars) -> autograd.Variable:
+            return torch.cat([v for v in vars])
 
-        self.log_likelihood = cat_vars(self.log_likelihood)  # size: (batch,)
-        self.value_estimates = cat_vars(self.value_estimates)  # size: (batch,)
-        self.rewards = self._float_var(self.rewards)  # size: (batch,)
+        self.log_likelihood_var = cat_vars(self.log_likelihood_list)  # size: (batch,)
+        self.value_estimates_var = cat_vars(self.value_estimates_list)  # size: (batch,)
+        self.rewards_var = self._float_var(self.rewards_list)  # size: (batch,)
 
     def _update_weights(self):
         r"""Updates the global weights using the current local gradients"""
@@ -266,7 +260,7 @@ class A3C:
         Returns:
             bool: True if this step should be logged, false otherwise
         """
-        return self.local_steps % 10 == 0
+        return self.local_steps % 100 == 0
 
     def _output_summary(self):
         r"""Writes out the relevant statistics, viewable in tensorboard"""
@@ -291,7 +285,7 @@ class A3C:
              This variable will be on the GPU, if `self.is_cuda` is True.
         """
         x = torch.FloatTensor(np.array(x))
-        if self.is_cuda:
+        if self.model.is_cuda:
             x = x.cuda()
         return autograd.Variable(x)
 
@@ -324,34 +318,3 @@ class A3C:
         for i in range(len(rewards)-2, -1, -1):
             d[i] = rewards[i] + d[i + 1] * self.gamma
         return self._float_var(d)
-
-    def _environment(self):
-        r"""Get the current environment"""
-        return self.environments[self.environment_id]
-
-    def _state(self):
-        r"""Get the model state for the current environment"""
-        if self.states[self.environment_id] is None:
-            self.states[self.environment_id] = self.model.get_initial_state()
-        return self.states[self.environment_id]
-
-    def _set_state(self, state):
-        r"""Set the model state for the current environment"""
-        self.states[self.environment_id] = state
-
-    def _next_environment(self):
-        r"""Advance to the next environment"""
-        self.environment_id += 1
-        self.environment_id %= len(self.environments)
-
-    def _observation(self):
-        r"""Get the observation for the current environment"""
-        if self.observations[self.environment_id] is None:
-            self.observations[self.environment_id] = self._float_var(self._environment().reset())
-        return self.observations[self.environment_id]
-
-    def _set_observation(self, observation):
-        r"""Set the observation for the current environment"""
-        if observation is not None:
-            observation = self._float_var(observation)
-        self.observations[self.environment_id] = observation
