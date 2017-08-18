@@ -7,6 +7,67 @@ from collections import namedtuple
 import math
 import operator
 from functools import reduce
+from typing import Iterable
+
+
+class Perception(nn.Module):
+    r"""Perception module, taking in the screen pixels, and outputting the feature vector.
+
+    """
+    def __init__(self, ob_space):
+        super(Perception, self).__init__()
+        self.ob_space = list(ob_space)
+        num_conv_layers = 4
+        conv_channels = 32
+        channels = [self.ob_space[-1]] + [conv_channels]*num_conv_layers
+
+        self.conv = [nn.Conv2d(i, o, kernel_size=3, stride=2, padding=1)
+                     for (i, o) in zip(channels, channels[1:])]
+
+        for i, c in enumerate(self.conv):
+            self.add_module('conv_{}'.format(i), c)
+
+        self.conv_size_out = tuple([math.ceil(d / 2**num_conv_layers) for d in ob_space[0:2]] + [channels[-1]])
+        self.feature_space = reduce(operator.mul, self.conv_size_out)
+
+    def forward(self, observation: autograd.Variable) -> autograd.Variable:
+        x = observation  # shape: (channels, height, width)
+        x = x.unsqueeze(0)  # shape: (1, channels, height, width)
+        for i in range(4):
+            x = self.conv[i](x)
+            x = F.elu(x)
+        # x shape: (1, channels_final, height_final, width_final)
+
+        return x.view(1, self.feature_space)
+
+class Action(nn.Module):
+    def __init__(self, hidden_space, ac_space):
+        super(Action, self).__init__()
+        self.hidden_space = hidden_space
+        self.ac_space = ac_space
+
+        self.logits = nn.Linear(self.hidden_space, self.ac_space)
+        self.vf = nn.Linear(self.hidden_space, 1)
+
+    def forward(self, hidden: autograd.Variable) -> (autograd.Variable, autograd.Variable):
+        logits = self.logits(hidden)
+        policy = F.log_softmax(logits).squeeze(0)  # shape: (ac_space)
+
+        vf = self.vf(hidden).squeeze()  # shape: (1)
+        return policy, vf
+
+class Memory(nn.Module):
+    def __init__(self, feature_space, hidden_space):
+        super(Memory, self).__init__()
+        self.feature_space = feature_space
+        self.hidden_space = hidden_space
+
+        self.lstm = nn.LSTMCell(input_size=self.feature_space,
+                                hidden_size=self.hidden_space)
+
+    def forward(self, features: autograd.Variable, state_in: 'ModelState') -> 'ModelState':
+        x, c = self.lstm(features, state_in)
+        return ModelState(x, c)
 
 
 class Model(nn.Module):
@@ -26,43 +87,27 @@ class Model(nn.Module):
         - **vf** (scalar): valuation of the current state
         - **state_out** (State): internal state, to be fed into next call
     """
-    def __init__(self, ob_space, ac_space, is_cuda=False):
+    def __init__(self, ob_space, ac_space, hidden_space=256, is_cuda=False):
         super(Model, self).__init__()
-        self.ob_space = list(ob_space)
-        self.ac_space = ac_space
+        self.perception = Perception(ob_space)
+        self.memory = Memory(self.perception.feature_space, hidden_space)
+        self.action = Action(hidden_space, ac_space)
+
         self.is_cuda = is_cuda
-        num_conv_layers = 4
-        conv_channels = 32
-        channels = [self.ob_space[-1]] + [conv_channels]*num_conv_layers
-
-        self.conv = [nn.Conv2d(i, o, kernel_size=3, stride=2, padding=1)
-                     for (i, o) in zip(channels, channels[1:])]
-
-        for i, c in enumerate(self.conv):
-            self.add_module('conv_{}'.format(i), c)
-
-        self.conv_size_out = tuple([math.ceil(d / 2**num_conv_layers) for d in ob_space[0:2]] + [channels[-1]])
-        self.lstm_size_in = reduce(operator.mul, self.conv_size_out)
-        self.lstm_size_state = 256
-        self.lstm = nn.LSTMCell(input_size=self.lstm_size_in,
-                                hidden_size=self.lstm_size_state)
-        self.logits = nn.Linear(self.lstm_size_state, ac_space)
-        self.vf = nn.Linear(self.lstm_size_state, 1)
 
         for p in self.parameters():
             if p.ndimension() >= 2:  # xavier initialization doesn't apply to biases
                 nn_init.xavier_uniform(p.data)
             else:
                 p.data.zero_()  # initialize biases to zero
-        # self.logits.weight.data = normalized_columns_initializer(self.logits.weight.data, 1.0)
-        # self.vf.weight.data = normalized_columns_initializer(self.vf.weight.data, 1.0)
+
         self.share_memory()
         if self.is_cuda:
             self.cuda()
         self.train()
 
-    def forward(self, inputs: autograd.Variable, state_in: 'ModelState') -> \
-            (autograd.Variable, autograd.Variable, 'ModelState'):
+    def forward(self, input: autograd.Variable, state_in: 'ModelState') -> \
+            (autograd.Variable, autograd.Variable, autograd.Variable):
         r"""Run the network to get
 
         Args:
@@ -76,25 +121,17 @@ class Model(nn.Module):
             * vf (Variable): estimation of the value of the current state (before taking any action). Size: `
             * state_out (State): LSTM cell state. Should be fed back into the next call to `forward`.
         """
-        x = inputs  # shape: (channels, height, width)
-        x = x.unsqueeze(0)  # shape: (1, channels, height, width)
-        for i in range(4):
-            x = self.conv[i](x)
-            x = F.elu(x)
-        # x shape: (1, channels_final, height_final, width_final)
+        features = self.perception(input)
+        hidden, _ = self.memory(features, state_in)
+        policy, vf = self.action(hidden)
+        return policy, vf, features
 
-        x = x.view(1, self.lstm_size_in)
-        # x shape: (1, self.lstm_size_in)
-
-        x, c = self.lstm(x, state_in)
-        state_out = ModelState(x, c)
-        # x shape: (1, self.lstm_size_state)
-
-        logits = self.logits(x)
-        policy = F.log_softmax(logits).squeeze(0)  # shape: (ac_space)
-
-        vf = self.vf(x).squeeze()  # shape: (1)
-        return policy, vf, state_out
+    def forward_state(self, features: Iterable[autograd.Variable], state_in: 'ModelState') -> 'ModelState':
+        state = state_in
+        for feature in features:
+            hidden, cell = self.memory(feature, state)
+            state = ModelState(hidden, cell)
+        return state
 
     def get_initial_state(self) -> 'ModelState':
         r"""Returns the initial state of the LTSM cell.
@@ -102,7 +139,7 @@ class Model(nn.Module):
         The state should reset to this at the beginning of each episode.
 
         """
-        z = torch.zeros(1, self.lstm_size_state)
+        z = torch.zeros(1, self.memory.hidden_space)
         h = autograd.Variable(z)
         c = autograd.Variable(z)
         if self.is_cuda:
@@ -137,42 +174,42 @@ class Model(nn.Module):
             param_other.data = param_self.data.clone()
         return new_model
 
-    def load_gradients(self, other: 'Model'):
-        r"""Load the gradients from another model into this model
-
-        Args:
-            other: The model which gradients are loaded FROM.
-
-        """
-        for param_self, param_other in self._param_pairs(other):
-            if param_self.grad is None:
-                param_self.sum().backward()  # hack to make `param_self.grad` exist, so we can copy into it
-            param_self.grad.data.copy_(param_other.grad.data)
-
-    def load_parameters(self, other: 'Model'):
-        r"""Load parameters from another model into this model.
-
-        Args:
-            other: The model which parameters are loaded FROM
-
-        """
-        for param_self, param_other in self._param_pairs(other):
-            param_self.data.copy_(param_other.data)
-
-    def _param_pairs(self, other: 'Model'):
-        r"""Get the pairs of :class:`nn.Parameter` objects with matching names.
-
-        Args:
-            other: The model whose parameters should be matched with `self`'s parameters
-
-        Returns:
-            Generator[(nn.Parameter, nn.Parameter)]: where the first parameter in each pair is from `self`,
-                and the second is from `other`.
-        """
-        param_pairs = zip(self.named_parameters(), other.named_parameters())
-        for (name_self, param_self), (name_other, param_other) in param_pairs:
-            assert(name_self == name_other)
-            yield (param_self, param_other)
+    # def load_gradients(self, other: 'Model'):
+    #     r"""Load the gradients from another model into this model
+    #
+    #     Args:
+    #         other: The model which gradients are loaded FROM.
+    #
+    #     """
+    #     for param_self, param_other in self._param_pairs(other):
+    #         if param_self.grad is None:
+    #             param_self.sum().backward()  # hack to make `param_self.grad` exist, so we can copy into it
+    #         param_self.grad.data.copy_(param_other.grad.data)
+    #
+    # def load_parameters(self, other: 'Model'):
+    #     r"""Load parameters from another model into this model.
+    #
+    #     Args:
+    #         other: The model which parameters are loaded FROM
+    #
+    #     """
+    #     for param_self, param_other in self._param_pairs(other):
+    #         param_self.data.copy_(param_other.data)
+    #
+    # def _param_pairs(self, other: 'Model'):
+    #     r"""Get the pairs of :class:`nn.Parameter` objects with matching names.
+    #
+    #     Args:
+    #         other: The model whose parameters should be matched with `self`'s parameters
+    #
+    #     Returns:
+    #         Generator[(nn.Parameter, nn.Parameter)]: where the first parameter in each pair is from `self`,
+    #             and the second is from `other`.
+    #     """
+    #     param_pairs = zip(self.named_parameters(), other.named_parameters())
+    #     for (name_self, param_self), (name_other, param_other) in param_pairs:
+    #         assert(name_self == name_other)
+    #         yield (param_self, param_other)
 
 class ModelState(namedtuple("ModelState", ["hidden", "cell"])):
     r"""Holds the state of the LSTM cell in a model
@@ -185,3 +222,7 @@ class ModelState(namedtuple("ModelState", ["hidden", "cell"])):
     def detach_(self):
         self.hidden.detach_()
         self.cell.detach_()
+
+    def detach(self):
+        return ModelState(self.hidden.detach(), self.cell.detach())
+

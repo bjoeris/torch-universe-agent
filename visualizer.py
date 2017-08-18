@@ -19,7 +19,8 @@ class Visualizer:
         while not self.terminate.value:
             self.env.render()
 
-            log_prob, value, state = self.model(observation, state)
+            log_prob, value, feature = self.model(observation, state)
+            state = self.model.forward_state([feature], state)
             prob = torch.exp(log_prob)
             action = prob.data.multinomial(1).cpu().numpy()[0]
 

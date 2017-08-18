@@ -62,7 +62,7 @@ def save_checkpoint(model, optimizer, global_steps, checkpoint_dir):
     torch.save(state_dict, path)
 
 def main():
-    multiprocessing.set_start_method('forkserver')
+    multiprocessing.set_start_method('spawn')
     args = parser.parse_args()
     env = lambda: create_atari_env(args.env_id)
     env0 = env()
